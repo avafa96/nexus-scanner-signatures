@@ -21,10 +21,16 @@ def client():
     return config, dict(os.environ)
 
 
-def transfer(config, env, source, target, allow_missing=False):
+def transfer(config, env, source, target, allow_missing=False, byte_range=None):
     upload = isinstance(source, pathlib.Path) and str(target).startswith("s3://")
     download = str(source).startswith("s3://") and isinstance(target, pathlib.Path)
     assert upload or download
+    if byte_range is not None:
+        assert download and len(byte_range) == 3
+        start, end, total = byte_range
+        assert all(type(value) is int for value in byte_range)
+        assert 0 <= start <= end < total <= CHUNK_BYTES
+        assert end - start + 1 <= READ_CHUNK_BYTES
     address = str(target) if upload else str(source)
     bucket, key = address[5:].split("/", 1)
     assert config["endpoint"] == "https://client.nexusaerosupply.com"
@@ -46,6 +52,10 @@ def transfer(config, env, source, target, allow_missing=False):
     path = "/" + bucket + "/" + key
     signed = "host;x-amz-content-sha256;x-amz-date"
     headers = "host:client.nexusaerosupply.com\nx-amz-content-sha256:" + payload + "\nx-amz-date:" + stamp + "\n"
+    if byte_range is not None:
+        range_value = "bytes=" + str(start) + "-" + str(end)
+        signed = "host;range;x-amz-content-sha256;x-amz-date"
+        headers = "host:client.nexusaerosupply.com\nrange:" + range_value + "\nx-amz-content-sha256:" + payload + "\nx-amz-date:" + stamp + "\n"
     canonical = method + "\n" + path + "\n\n" + headers + "\n" + signed + "\n" + payload
     to_sign = "AWS4-HMAC-SHA256\n" + stamp + "\n" + scope + "\n" + hashlib.sha256(canonical.encode()).hexdigest()
     def sign(value, message):
@@ -59,15 +69,20 @@ def transfer(config, env, source, target, allow_missing=False):
     response = pathlib.Path(os.environ["RUNNER_TEMP"]) / "scanner-feed-transfer-response.xml" if upload else target
     clean_env = {k: v for k, v in env.items() if k not in {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "NEXUS_SCANNER_FEED_CREDENTIAL"}}
     command = ["curl", "--config", "-", "--silent", "--show-error", "--http1.1",
-               "--connect-timeout", "15", "--max-time", "720", "--request", method,
+               "--connect-timeout", "15", "--max-time", "120", "--speed-limit", "1024", "--speed-time", "30", "--request", method,
                "--header", "Expect:", "--header", "x-amz-content-sha256: " + payload,
                "--header", "x-amz-date: " + stamp, "--output", str(response),
                "--write-out", "%{http_code}", "--url", config["endpoint"] + path]
     if upload:
         command += ["--upload-file", str(source)]
-    result = subprocess.run(command, env=clean_env, input=curl_config, capture_output=True, text=True, timeout=750)
+    if byte_range is not None:
+        response_headers = response.with_name(response.name + ".headers")
+        assert not response_headers.is_symlink()
+        command += ["--header", "Range: " + range_value, "--dump-header", str(response_headers)]
+    result = subprocess.run(command, env=clean_env, input=curl_config, capture_output=True, text=True, timeout=150)
     status = int(result.stdout) if re.fullmatch(r"[0-9]{3}", result.stdout) else 0
-    if result.returncode != 0 or status != 200:
+    expected_status = 206 if byte_range is not None else 200
+    if result.returncode != 0 or status != expected_status:
         label = "HTTP_ERROR"
         if response.is_file() and response.stat().st_size <= 65536:
             try:
@@ -78,13 +93,20 @@ def transfer(config, env, source, target, allow_missing=False):
                 pass
         if download and allow_missing and result.returncode == 0 and status == 404 and label == "NoSuchKey":
             return False
-        raise RuntimeError("Scoped scanner transfer failed (" + label + ", http=" + str(status) + ", transport=" + str(result.returncode) + "); protected output suppressed")
+        received = response.stat().st_size if download and response.is_file() else 0
+        raise RuntimeError("Scoped scanner transfer failed (" + label + ", http=" + str(status) + ", transport=" + str(result.returncode) + ", receivedBytes=" + str(received) + "); protected output suppressed")
     if download:
         assert response.is_file() and not response.is_symlink() and response.stat().st_size <= 160_000_000
+    if byte_range is not None:
+        assert response.stat().st_size == end - start + 1
+        assert response_headers.is_file() and response_headers.stat().st_size <= 65536
+        ranges = [line.split(":", 1)[1].strip() for line in response_headers.read_text().splitlines() if line.lower().startswith("content-range:")]
+        assert ranges == ["bytes " + str(start) + "-" + str(end) + "/" + str(total)]
     return True
 
 
 CHUNK_BYTES = 8 * 1024 * 1024
+READ_CHUNK_BYTES = 4 * 1024 * 1024
 TRANSFER_SCHEMA = "NEXUS_OFFICIAL_SCANNER_CHUNKS_V1"
 
 
@@ -126,8 +148,14 @@ def restore_chunks(config, env, descriptor, target, category):
     with tempfile.TemporaryDirectory(prefix="scanner-restore-", dir=os.environ["RUNNER_TEMP"]) as temporary:
         chunk = pathlib.Path(temporary) / "part.bin"
         with target.open("wb") as output:
-            for part in parts:
-                transfer(config, env, "s3://nexus-scanner-signatures/" + part["key"], chunk)
+            for index, part in enumerate(parts):
+                print(json.dumps({"operation": "RESTORE_VERIFIED_STATE_CHUNK", "chunk": index + 1, "totalChunks": len(parts), "bytes": part["bytes"]}), flush=True)
+                piece = chunk.with_name("range.bin")
+                with chunk.open("wb") as joined:
+                    for start in range(0, part["bytes"], READ_CHUNK_BYTES):
+                        end = min(start + READ_CHUNK_BYTES, part["bytes"]) - 1
+                        transfer(config, env, "s3://nexus-scanner-signatures/" + part["key"], piece, byte_range=(start, end, part["bytes"]))
+                        joined.write(piece.read_bytes())
                 assert chunk.stat().st_size == part["bytes"]
                 with chunk.open("rb") as data:
                     assert hashlib.file_digest(data, "sha256").hexdigest() == part["sha256"]
@@ -171,12 +199,10 @@ def main():
         if not (packet / "update.log").is_file():
             return
         paths = [database / "freshclam.dat"]
-        for name in ["main", "daily", "bytecode"]:
-            cvd = database / (name + ".cvd")
-            if cvd.is_file():
-                with cvd.open("rb") as data:
-                    version = int(data.read(512).decode("ascii").split(":")[2])
-                paths.extend([cvd, database / (name + "-" + str(version) + ".cvd.sign")])
+        # Preserve the exact client identity/cooldown. Static CVDs come from the
+        # pinned official image and FreshClam; they need not cross the feed twice.
+        assert paths[0].is_file() and not paths[0].is_symlink()
+        assert 0 < paths[0].stat().st_size <= 1_048_576
         with tarfile.open(state, "w:gz") as tar:
             for path in paths:
                 if path.is_file():

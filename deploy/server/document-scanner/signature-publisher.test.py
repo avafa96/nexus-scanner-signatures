@@ -4,6 +4,8 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -106,6 +108,37 @@ class FeedTransferBoundary(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'AccessDenied'):
                 publisher.transfer(self.config, self.environment, self.target, target, allow_missing=True)
 
+    def test_range_is_signed_and_exact_response_is_required(self):
+        target = self.folder / 'range.bin'
+        def response(command, **kwargs):
+            target.write_bytes(b'0123456789')
+            pathlib.Path(command[command.index('--dump-header') + 1]).write_text('HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-9/20\r\n\r\n')
+            self.assertIn('Range: bytes=0-9', command)
+            self.assertIn('SignedHeaders=host;range;x-amz-content-sha256;x-amz-date', kwargs['input'])
+            self.assertNotIn(self.config['secretKey'], kwargs['input'])
+            self.assertIn('120', command)
+            self.assertNotIn('--insecure', command)
+            return subprocess.CompletedProcess(command, 0, '206', '')
+        with patch.object(publisher.subprocess, 'run', side_effect=response):
+            self.assertTrue(publisher.transfer(self.config, self.environment, self.target, target, byte_range=(0,9,20)))
+
+    def test_range_rejects_ignored_or_mismatched_partial_response(self):
+        target = self.folder / 'range.bin'
+        for status, header, body in [('200','bytes 0-9/20',b'0123456789'),('206','bytes 1-10/20',b'0123456789'),('206','bytes 0-9/20',b'0123')]:
+            with self.subTest(status=status,header=header,bytes=len(body)):
+                def response(command, **kwargs):
+                    target.write_bytes(body)
+                    pathlib.Path(command[command.index('--dump-header') + 1]).write_text('Content-Range: '+header+'\r\n')
+                    return subprocess.CompletedProcess(command,0,status,'')
+                with patch.object(publisher.subprocess,'run',side_effect=response), self.assertRaises((RuntimeError,AssertionError)):
+                    publisher.transfer(self.config,self.environment,self.target,target,byte_range=(0,9,20))
+
+    def test_range_bounds_are_checked_before_network(self):
+        for spec in [(-1,9,20),(0,20,20),(0,publisher.READ_CHUNK_BYTES,publisher.CHUNK_BYTES),('0',9,20)]:
+            with self.subTest(spec=spec), patch.object(publisher.subprocess,'run') as run, self.assertRaises(AssertionError):
+                publisher.transfer(self.config,self.environment,self.target,self.folder/'range.bin',byte_range=spec)
+            run.assert_not_called()
+
 
 class ChunkPublisherTests(unittest.TestCase):
     setUp = FeedTransferBoundary.setUp
@@ -122,11 +155,25 @@ class ChunkPublisherTests(unittest.TestCase):
         data = b"Synthetic-state-packet"
         digest = hashlib.sha256(data).hexdigest()
         descriptor = {'transferSchema': publisher.TRANSFER_SCHEMA, 'transferRunId': '123', 'archiveSha256': digest, 'archiveBytes': len(data), 'chunks': [{'key': 'official/chunks/123/state/' + digest + '/000.part', 'bytes': len(data), 'sha256': digest}]}
-        def tamper(config, env, source, target):
+        def tamper(config, env, source, target, **kwargs):
             target.write_bytes(b'X' * len(data))
         with patch.object(publisher, 'transfer', side_effect=tamper):
             with self.assertRaises(AssertionError):
                 publisher.restore_chunks(self.config, self.environment, descriptor, self.folder / 'restored.tar.gz', 'state')
+
+    def test_sequential_ranges_reconstruct_and_verify_complete_state(self):
+        data=b'Synthetic-state-packet'
+        digest=hashlib.sha256(data).hexdigest()
+        descriptor={'transferSchema':publisher.TRANSFER_SCHEMA,'transferRunId':'123','archiveSha256':digest,'archiveBytes':len(data),'chunks':[{'key':'official/chunks/123/state/'+digest+'/000.part','bytes':len(data),'sha256':digest}]}
+        ranges=[]
+        def read(config,env,source,target,byte_range):
+            start,end,total=byte_range;ranges.append(byte_range)
+            self.assertEqual(total,len(data));target.write_bytes(data[start:end+1])
+        target=self.folder/'restored.tar.gz'
+        with patch.object(publisher,'READ_CHUNK_BYTES',8),patch.object(publisher,'transfer',side_effect=read):
+            publisher.restore_chunks(self.config,self.environment,descriptor,target,'state')
+        self.assertEqual(target.read_bytes(),data)
+        self.assertEqual(ranges,[(0,7,len(data)),(8,15,len(data)),(16,len(data)-1,len(data))])
 
     def test_out_of_scope_chunk_is_refused_before_network(self):
         descriptor = {'transferSchema': publisher.TRANSFER_SCHEMA, 'transferRunId': '123', 'archiveSha256': 'a' * 64, 'archiveBytes': 1, 'chunks': [{'key': 'customer-documents/private', 'bytes': 1, 'sha256': 'b' * 64}]}
@@ -134,6 +181,25 @@ class ChunkPublisherTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 publisher.restore_chunks(self.config, self.environment, descriptor, self.folder / 'restored.tar.gz', 'state')
             transfer.assert_not_called()
+
+    def test_state_preserves_exact_client_cooldown_without_duplicate_cvds(self):
+        packet=self.folder/'clamav-packet';database=packet/'databases';database.mkdir(parents=True)
+        state=b'unchanged synthetic client identity and cooldown'
+        (database/'freshclam.dat').write_bytes(state)
+        (database/'main.cvd').write_bytes(b'Synthetic cache; must not enter client-state archive')
+        (packet/'update.log').write_text('One supported updater attempt')
+        with patch.dict(os.environ,{'GITHUB_RUN_ID':'123'}),patch.object(sys,'argv',['publisher','state']),patch.object(publisher,'client',return_value=(self.config,self.environment)),patch.object(publisher,'transfer'):
+            publisher.main()
+        with tarfile.open(packet/'freshclam-state.tar.gz','r:gz') as archive:
+            self.assertEqual(archive.getnames(),['freshclam.dat'])
+            self.assertEqual(archive.extractfile('freshclam.dat').read(),state)
+
+    def test_missing_client_state_never_publishes_an_empty_reset(self):
+        packet=self.folder/'clamav-packet';(packet/'databases').mkdir(parents=True)
+        (packet/'update.log').write_text('Failed before client state was available')
+        with patch.object(sys,'argv',['publisher','state']),patch.object(publisher,'client',return_value=(self.config,self.environment)),patch.object(publisher,'transfer') as transfer,self.assertRaises(AssertionError):
+            publisher.main()
+        transfer.assert_not_called()
 
 
 if __name__ == '__main__':

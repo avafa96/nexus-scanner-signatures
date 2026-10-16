@@ -63,8 +63,10 @@ jobs:
           LogTime yes
           CONF
           docker pull "$image"
+          # Seed cached vendor CVDs only; never replace restored client/cooldown state.
           docker run --rm --pull never --network none --memory 128m --security-opt no-new-privileges:true \
-            --mount "type=bind,source=$packet/databases,target=/updates" --entrypoint chown "$image" clamav:clamav /updates
+            --mount "type=bind,source=$packet/databases,target=/updates" --entrypoint sh "$image" -c \
+            'for f in /var/lib/clamav/*.cvd /var/lib/clamav/*.cvd.sign; do [ -f "$f" ] || continue; target="/updates/$(basename "$f")"; [ -e "$target" ] || cp "$f" "$target"; done; chown -R clamav:clamav /updates'
           # One fresh client using the supported updater. No application secrets,
           # customer files, server connection or server cooldown state is used.
           docker run --rm --pull never --memory 4g --cpus 1 --pids-limit 128 --security-opt no-new-privileges:true \
