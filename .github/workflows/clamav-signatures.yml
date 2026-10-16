@@ -1,0 +1,135 @@
+name: Official ClamAV signature preparation
+
+on:
+  schedule:
+    - cron: "17 */8 * * *"
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Exact source commit for this isolated signature candidate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: official-clamav-signature-preparation
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || vars.NEXUS_SCANNER_FEED_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify bounded feed transfer controls
+        run: |
+          python3 deploy/server/document-scanner/signature-publisher.test.py
+      - name: Restore persistent official updater state
+        if: vars.NEXUS_SCANNER_FEED_ENABLED == 'true'
+        env:
+          NEXUS_SCANNER_FEED_CREDENTIAL: ${{ secrets.NEXUS_SCANNER_FEED_CREDENTIAL }}
+        run: python3 deploy/server/document-scanner/signature-publisher.py restore
+      - name: Prepare official signatures and run engine checks
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            test "$EXPECTED_COMMIT" = "$(git rev-parse HEAD)"
+          else
+            test "$GITHUB_EVENT_NAME" = schedule
+            test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          fi
+          image='clamav/clamav:1.5.4-debian13-slim@sha256:9bb8712a50f0e75166e936c452cd82dd5e5be0b85586598930b5bbb84a99a578'
+          packet="$RUNNER_TEMP/clamav-packet"
+          fixtures="$RUNNER_TEMP/clamav-fixtures"
+          mkdir -p "$packet/databases" "$fixtures"
+          cat > "$packet/freshclam.conf" <<'CONF'
+          DatabaseDirectory /updates
+          DatabaseOwner clamav
+          DatabaseMirror database.clamav.net
+          ScriptedUpdates no
+          MaxAttempts 1
+          ConnectTimeout 15
+          ReceiveTimeout 60
+          TestDatabases yes
+          Bytecode yes
+          LogTime yes
+          CONF
+          docker pull "$image"
+          docker run --rm --pull never --network none --memory 128m --security-opt no-new-privileges:true \
+            --mount "type=bind,source=$packet/databases,target=/updates" --entrypoint chown "$image" clamav:clamav /updates
+          # One fresh client using the supported updater. No application secrets,
+          # customer files, server connection or server cooldown state is used.
+          docker run --rm --pull never --memory 4g --cpus 1 --pids-limit 128 --security-opt no-new-privileges:true \
+            --mount "type=bind,source=$packet/databases,target=/updates" \
+            --mount "type=bind,source=$packet/freshclam.conf,target=/readiness/freshclam.conf,readonly" \
+            --entrypoint freshclam "$image" --config-file=/readiness/freshclam.conf --stdout > "$packet/update.log" 2>&1
+          for database in main daily bytecode; do
+            docker run --rm --pull never --network none --memory 512m --security-opt no-new-privileges:true \
+              --mount "type=bind,source=$packet/databases,target=/updates,readonly" \
+              --entrypoint sigtool "$image" --info="/updates/$database.cvd" > "$packet/$database-verification.log" 2>&1
+            grep -q 'Verification OK' "$packet/$database-verification.log"
+          done
+          printf 'Nexus synthetic clean scanner fixture; no customer data.\n' > "$fixtures/clean.txt"
+          cat > "$fixtures/infected.txt" <<'EICAR'
+          X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*
+          EICAR
+          scan() {
+            docker run --rm --pull never --network none --memory 4g --cpus 1 --pids-limit 128 --security-opt no-new-privileges:true \
+              --mount "type=bind,source=$packet/databases,target=/updates,readonly" \
+              --mount "type=bind,source=$fixtures,target=/fixtures,readonly" \
+              --entrypoint clamscan "$image" --database=/updates --no-summary "/fixtures/$1"
+          }
+          scan clean.txt > "$packet/clean-engine.log" 2>&1
+          set +e
+          scan infected.txt > "$packet/infected-engine.log" 2>&1
+          infected_status=$?
+          set -e
+          test "$infected_status" -eq 1
+          grep -q 'FOUND' "$packet/infected-engine.log"
+          PACKET="$packet" SCANNER_IMAGE="$image" python3 - <<'PY'
+          import datetime,hashlib,json,os,pathlib
+          packet=pathlib.Path(os.environ['PACKET'])
+          daily=(packet/'databases/daily.cvd').open('rb').read(512).decode('ascii').split(':')
+          assert daily[0]=='ClamAV-VDB'
+          published=datetime.datetime.fromtimestamp(int(daily[8].strip()),datetime.timezone.utc)
+          now=datetime.datetime.now(datetime.timezone.utc)
+          age=(now-published).total_seconds()
+          assert -300<=age<=86400, 'Official signatures must be current'
+          selected=[]
+          for name in ['main','daily','bytecode']:
+              cvd=packet/'databases'/f'{name}.cvd'
+              with cvd.open('rb') as data: version=int(data.read(512).decode('ascii').split(':')[2])
+              selected.extend([cvd,packet/'databases'/f'{name}-{version}.cvd.sign'])
+          files=[]
+          for path in sorted(selected):
+              assert path.is_file() and not path.is_symlink()
+              files.append({'name':path.name,'bytes':path.stat().st_size,'sha256':hashlib.file_digest(path.open('rb'),'sha256').hexdigest()})
+          assert len([f for f in files if f['name'].endswith('.cvd')])==3
+          manifest={'schema':'NEXUS_OFFICIAL_SCANNER_SIGNATURE_PACKET_V1','sourceCommit':os.environ['GITHUB_SHA'],'runId':os.environ['GITHUB_RUN_ID'],'image':os.environ['SCANNER_IMAGE'],'officialSource':'database.clamav.net via FreshClam','dailyVersion':int(daily[2]),'publishedAt':published.isoformat(),'preparedAt':now.isoformat(),'signatureAgeSeconds':age,'cryptographicVerification':'PASSED','engineLoadTest':'PASSED','cleanEngineCheck':'PASSED','infectedEngineCheck':'PASSED','productionMutations':False,'customerDocumentsUsed':False,'files':files}
+          (packet/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          (packet/'packet-files.txt').write_text('manifest.json\n'+''.join('databases/'+entry['name']+'\n' for entry in files))
+          print(json.dumps({k:manifest[k] for k in ['dailyVersion','publishedAt','cryptographicVerification','engineLoadTest','cleanEngineCheck','infectedEngineCheck']}))
+          PY
+          # Retain only the verified packet and harmless diagnostics.
+          sudo chmod -R a+rX "$packet"
+          cd "$packet"
+          tar -czf "$RUNNER_TEMP/clamav-official-signatures.tar.gz" --files-from packet-files.txt
+          cp manifest.json "$RUNNER_TEMP/clamav-official-signatures-manifest.json"
+      - name: Preserve official updater state, including cooldown
+        if: always() && vars.NEXUS_SCANNER_FEED_ENABLED == 'true'
+        env:
+          NEXUS_SCANNER_FEED_CREDENTIAL: ${{ secrets.NEXUS_SCANNER_FEED_CREDENTIAL }}
+        run: python3 deploy/server/document-scanner/signature-publisher.py state
+      - name: Publish verified packet to the private signature feed
+        if: vars.NEXUS_SCANNER_FEED_ENABLED == 'true'
+        env:
+          NEXUS_SCANNER_FEED_CREDENTIAL: ${{ secrets.NEXUS_SCANNER_FEED_CREDENTIAL }}
+        run: python3 deploy/server/document-scanner/signature-publisher.py publish
