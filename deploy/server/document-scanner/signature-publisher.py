@@ -39,7 +39,7 @@ def transfer(config, env, source, target, allow_missing=False, byte_range=None):
     assert re.fullmatch(r"[A-Za-z0-9_-]{3,128}", config["accessKey"])
     assert re.fullmatch(r"[a-z0-9-]{1,40}", config["region"])
     if upload:
-        assert source.is_file() and not source.is_symlink() and source.stat().st_size <= 160_000_000
+        assert source.is_file() and not source.is_symlink() and source.stat().st_size <= WRITE_CHUNK_BYTES
         with source.open("rb") as data:
             payload = hashlib.file_digest(data, "sha256").hexdigest()
     else:
@@ -106,7 +106,9 @@ def transfer(config, env, source, target, allow_missing=False, byte_range=None):
 
 
 CHUNK_BYTES = 8 * 1024 * 1024
+WRITE_CHUNK_BYTES = 1024 * 1024
 READ_CHUNK_BYTES = 4 * 1024 * 1024
+MAX_CHUNKS = 160
 TRANSFER_SCHEMA = "NEXUS_OFFICIAL_SCANNER_CHUNKS_V1"
 
 
@@ -115,20 +117,22 @@ def store_chunks(config, env, archive, category):
     assert re.fullmatch(r"[0-9]{1,24}", run) and category in {"packet", "state"}
     size = archive.stat().st_size
     assert 0 < size <= 160_000_000 and not archive.is_symlink()
+    assert (size + WRITE_CHUNK_BYTES - 1) // WRITE_CHUNK_BYTES <= MAX_CHUNKS
     with archive.open("rb") as data:
         digest = hashlib.file_digest(data, "sha256").hexdigest()
     parts = []
     with tempfile.TemporaryDirectory(prefix="scanner-chunks-", dir=os.environ["RUNNER_TEMP"]) as temporary:
         chunk = pathlib.Path(temporary) / "part.bin"
         with archive.open("rb") as data:
-            while block := data.read(CHUNK_BYTES):
+            while block := data.read(WRITE_CHUNK_BYTES):
                 key = "official/chunks/" + run + "/" + category + "/" + digest + "/" + f"{len(parts):03d}" + ".part"
                 chunk.write_bytes(block)
                 transfer(config, env, chunk, "s3://nexus-scanner-signatures/" + key)
                 parts.append({"key": key, "bytes": len(block), "sha256": hashlib.sha256(block).hexdigest()})
+                print(json.dumps({"operation": "PUBLISHED_VERIFIED_CHUNK", "kind": category, "chunk": len(parts), "bytes": len(block)}), flush=True)
     with archive.open("rb") as data:
         assert digest == hashlib.file_digest(data, "sha256").hexdigest()
-    assert size == sum(part["bytes"] for part in parts) and 1 <= len(parts) <= 20
+    assert size == sum(part["bytes"] for part in parts) and 1 <= len(parts) <= MAX_CHUNKS
     return {"transferSchema": TRANSFER_SCHEMA, "transferRunId": run, "archiveBytes": size, "archiveSha256": digest, "chunks": parts}
 
 
@@ -136,7 +140,7 @@ def restore_chunks(config, env, descriptor, target, category):
     assert descriptor["transferSchema"] == TRANSFER_SCHEMA and category in {"packet", "state"}
     run, parts = descriptor["transferRunId"], descriptor["chunks"]
     assert isinstance(run, str) and re.fullmatch(r"[0-9]{1,24}", run)
-    assert isinstance(parts, list) and 1 <= len(parts) <= 20
+    assert isinstance(parts, list) and 1 <= len(parts) <= MAX_CHUNKS
     assert isinstance(descriptor["archiveBytes"], int) and 0 < descriptor["archiveBytes"] <= 160_000_000
     assert re.fullmatch(r"[0-9a-f]{64}", descriptor["archiveSha256"])
     for index, part in enumerate(parts):
@@ -167,8 +171,21 @@ def restore_chunks(config, env, descriptor, target, category):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["restore", "state", "publish"])
+    parser.add_argument("mode", choices=["restore", "state", "publish", "probe"])
     args = parser.parse_args()
+    if args.mode == "probe":
+        config, env = client()
+        with tempfile.TemporaryDirectory(prefix="scanner-transport-probe-", dir=os.environ["RUNNER_TEMP"]) as temporary:
+            source = pathlib.Path(temporary) / "synthetic.bin"
+            target = pathlib.Path(temporary) / "roundtrip.bin"
+            fixture = b"NEXUS-SYNTHETIC-SCANNER-TRANSPORT-ONLY\n"
+            source.write_bytes((fixture * (WRITE_CHUNK_BYTES // len(fixture) + 1))[:WRITE_CHUNK_BYTES])
+            key = "s3://nexus-scanner-signatures/official/transport-check.bin"
+            transfer(config, env, source, key)
+            transfer(config, env, key, target)
+            assert source.read_bytes() == target.read_bytes()
+            print(json.dumps({"status": "BOUNDED_TRANSPORT_ROUNDTRIP_PASSED", "bytes": source.stat().st_size, "vendorContacted": False}))
+        return
     config, env = client()
     packet = pathlib.Path(os.environ["RUNNER_TEMP"]) / "clamav-packet"
     database = packet / "databases"
@@ -226,6 +243,7 @@ def main():
         assert descriptor["archiveSha256"] == digest
         pointer = packet / "current.json"
         pointer.write_text(json.dumps({**descriptor, "archiveKey": key, "manifest": manifest}) + "\n")
+        assert pointer.stat().st_size <= 65536
         # Commit the pointer last; a reader always gets a complete immutable packet.
         transfer(config, env, pointer, "s3://nexus-scanner-signatures/official/current.json")
         print(json.dumps({"status": "VERIFIED_OFFICIAL_PACKET_PUBLISHED", "runId": manifest["runId"], "dailyVersion": manifest["dailyVersion"], "archiveSha256": digest}))

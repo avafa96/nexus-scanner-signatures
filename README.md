@@ -13,3 +13,5 @@ Standard GitHub-hosted runners in a public repository are free. This job creates
 The business repository remains private. Never add customer data, secrets, generic remote execution, extra services or application release workflows here.
 
 Persisted updater chunks are restored through sequential signed reads of at most 4 MiB. Each response must match the requested Content-Range and size, and complete chunk/archive hashes remain mandatory. Transfers have bounded connect, stall and total deadlines; interrupted reads never initialize a new updater state or discard cooldown.
+
+Writes use at most 1 MiB per request to tolerate the existing network path. A synthetic 1 MiB upload/readback must pass before any vendor request. Packets remain limited to 160 MB, at most 160 content-bound chunks and a 64 KiB descriptor; the consumer verifies every part and the full archive before admission. The small client-state archive still preserves the exact updater identity and cooldown.

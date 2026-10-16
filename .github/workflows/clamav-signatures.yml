@@ -34,6 +34,11 @@ jobs:
         env:
           NEXUS_SCANNER_FEED_CREDENTIAL: ${{ secrets.NEXUS_SCANNER_FEED_CREDENTIAL }}
         run: python3 deploy/server/document-scanner/signature-publisher.py restore
+      - name: Verify bounded feed transport before contacting vendor
+        if: vars.NEXUS_SCANNER_FEED_ENABLED == 'true'
+        env:
+          NEXUS_SCANNER_FEED_CREDENTIAL: ${{ secrets.NEXUS_SCANNER_FEED_CREDENTIAL }}
+        run: python3 deploy/server/document-scanner/signature-publisher.py probe
       - name: Prepare official signatures and run engine checks
         env:
           EXPECTED_COMMIT: ${{ inputs.expected_commit }}

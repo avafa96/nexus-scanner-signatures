@@ -144,12 +144,45 @@ class ChunkPublisherTests(unittest.TestCase):
     setUp = FeedTransferBoundary.setUp
     def test_split_parts_stay_bounded_and_keys_bind_full_content(self):
         self.input.write_bytes(b"Synthetic-state-packet")
-        with patch.dict(os.environ, {'GITHUB_RUN_ID': '123'}), patch.object(publisher, 'CHUNK_BYTES', 8), patch.object(publisher, 'transfer') as transfer:
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '123'}), patch.object(publisher, 'WRITE_CHUNK_BYTES', 8), patch.object(publisher, 'transfer') as transfer:
             descriptor = publisher.store_chunks(self.config, self.environment, self.input, 'state')
         self.assertEqual(sum(p['bytes'] for p in descriptor['chunks']), self.input.stat().st_size)
         self.assertTrue(all(p['bytes'] <= 8 for p in descriptor['chunks']))
         self.assertTrue(all('/state/' + descriptor['archiveSha256'] + '/' in p['key'] for p in descriptor['chunks']))
         self.assertEqual(transfer.call_count, len(descriptor['chunks']))
+
+    def test_upload_refuses_large_request_before_network(self):
+        with patch.object(publisher, 'WRITE_CHUNK_BYTES', 8), patch.object(publisher.subprocess, 'run') as run:
+            with self.assertRaises(AssertionError):
+                publisher.transfer(self.config, self.environment, self.input, self.target)
+            run.assert_not_called()
+
+    def test_archive_requiring_too_many_parts_is_refused_before_publication(self):
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '123'}), patch.object(publisher, 'WRITE_CHUNK_BYTES', 1), patch.object(publisher, 'MAX_CHUNKS', 2), patch.object(publisher, 'transfer') as transfer:
+            with self.assertRaises(AssertionError):
+                publisher.store_chunks(self.config, self.environment, self.input, 'packet')
+            transfer.assert_not_called()
+
+    def test_probe_verifies_small_roundtrip_without_contacting_vendor_or_updater_state(self):
+        written = []
+        def roundtrip(config, env, source, target):
+            if isinstance(source, pathlib.Path):
+                self.assertEqual(source.stat().st_size, publisher.WRITE_CHUNK_BYTES)
+                self.assertEqual(target, 's3://nexus-scanner-signatures/official/transport-check.bin')
+                written.append(source.read_bytes())
+            else:
+                target.write_bytes(written[0])
+        with patch.object(sys, 'argv', ['publisher', 'probe']), patch.object(publisher, 'client', return_value=(self.config,self.environment)), patch.object(publisher, 'transfer', side_effect=roundtrip), patch.object(publisher.subprocess, 'run') as process:
+            publisher.main()
+            process.assert_not_called()
+        self.assertFalse((self.folder/'clamav-packet').exists())
+
+    def test_probe_refuses_corrupted_roundtrip_before_any_vendor_request(self):
+        def corrupt(config, env, source, target):
+            if isinstance(target, pathlib.Path):
+                target.write_bytes(b'TAMPERED')
+        with patch.object(sys, 'argv', ['publisher', 'probe']), patch.object(publisher, 'client', return_value=(self.config,self.environment)), patch.object(publisher, 'transfer', side_effect=corrupt), self.assertRaises(AssertionError):
+            publisher.main()
 
     def test_changed_part_fails_reconstruction(self):
         data = b"Synthetic-state-packet"
