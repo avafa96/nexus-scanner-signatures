@@ -2,7 +2,7 @@ name: Official ClamAV signature preparation
 
 on:
   schedule:
-    - cron: "17 */8 * * *"
+    - cron: "17 */2 * * *"
   workflow_dispatch:
     inputs:
       expected_commit:
